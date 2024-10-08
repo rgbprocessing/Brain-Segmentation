@@ -19,6 +19,7 @@
 # context and additional components, please refer to the project's documentation.
 
 from config_general import *
+from utils.data_utils import apply_noise
 import torch
 from torch.utils.data import Dataset
 import os
@@ -82,15 +83,6 @@ class BrainMRIDataset(Dataset):
         data= torch.load(os.path.join(sampledf,DATA_FILENAME))
         labels = torch.load(os.path.join(sampledf,LABELS_FILENAME))
         
-        # Apply random noise augmentation
-        noiseA = torch.randn(1, dtype=data.dtype) * self.noise
-        noiseB = torch.randn(1, dtype=data.dtype) * self.noise
-        data = data * ( 1 + noiseA) + noiseB
-    
-        # Apply Gaussian noise augmentation
-        gaussian_noise = torch.randn(data.shape, dtype=data.dtype) * self.gauss
-        data = data + gaussian_noise
-        
         # Ensure data is in the correct format [2, 192, 192, 192]
         if data.shape != DATA_SHAPE:
             raise ValueError(f"Unexpected data shape: {data.shape}")
@@ -108,6 +100,9 @@ class BrainMRIDataset(Dataset):
         # Apply additional transforms if specified
         if self.transform:
             dict_input = self.transform(dict_input)
+            
+        # Apply noise augmentation
+        dict_input = apply_noise(dict_input, self.noise, self.gauss)
             
         return dict_input
     

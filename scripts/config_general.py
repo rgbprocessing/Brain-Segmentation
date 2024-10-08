@@ -14,6 +14,7 @@ LABELS_FILENAME = "mask1B2G3P4L5W6E7V.pt"
 # Patch configuration
 PATCH_DATA_SHAPE = (2, 32, 32, 32)
 PATCH_LABELS_SHAPE = (7, 32, 32, 32)
+NUM_CLASSES_SAMPLE = 6                      #number of classes to sample from [0,NUM_CLASSES_SAMPLE] inclusive
 
 # Augmentation configurations
 GAUSS_NOISE = 1/50

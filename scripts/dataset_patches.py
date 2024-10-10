@@ -41,7 +41,7 @@ class BrainMRIDataset(Dataset):
     This class handles data loading, patch extraction, and data augmentation.
     """
     
-    def __init__(self, df_new, patch_size, num_samples, label_size, rotations=True, gauss=1/50, noise=1/50, transform=None): 
+    def __init__(self, df_new, patch_size, num_samples, rotations=True, gauss=1/50, noise=1/50, transform=None): 
         """
         Initialize the BrainMRIDataset.
 
@@ -60,7 +60,6 @@ class BrainMRIDataset(Dataset):
         self.df_new=df_new
         self.gauss = gauss
         self.noise = noise
-        self.label_size = label_size
         self.num_samples = num_samples
         self.transform = transform
         

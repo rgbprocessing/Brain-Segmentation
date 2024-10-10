@@ -20,12 +20,15 @@ DFPOOL_FILE = r'C:\Users\Dragon\Documents\GitHub\Brain-Segmentation\class_sums.x
 
 # Specify training parameters patches
 NUM_EPOCHS = 400
-IN_CHANNELS = 2 #modalities
+IN_CHANNELS = 2                             # Input modalities
 OUT_CHANNELS = 7
 LR = 0.001
-BATCH_SIZE = 80 #TODO
-NUM_SAMPLES = 80*16#TODO
+BATCH_SIZE = 8
+NUM_SAMPLES = 80*16
 PATCH_SIZE = 32
+LOSS_ALPHA = .5                             # Determines ratio loss functions 1 and 2 are combined
+ACCUMULATION = 1                            # Number of batches to accumulate before running back propagation
+VAL_THRESHOLD = 0.06                        # Threshold to only perform validation once train LI class is > threshold
 
 # Model parameters
 CHANNELS = (16, 32, 64, 128, 256)

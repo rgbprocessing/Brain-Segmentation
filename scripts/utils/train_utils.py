@@ -70,176 +70,179 @@ def create_run_folder():
     
     return run_dir, checkpoints_dir, logs_dir
 
-def train_model(model, train_loader, val_loader, criterion1, criterion2, optimizer, num_epochs, device, writer):
+def train_model(model, train_loader, val_loader, criterion1, criterion2, optimizer, num_epochs, device, writer, checkpoints_dir):
     """
     Main training loop for the brain MRI segmentation model.
     
     Args:
-        model (torch.nn.Module): The neural network model.
-        train_loader (DataLoader): DataLoader for training data.
-        val_loader (DataLoader): DataLoader for validation data.
-        criterion1 (callable): First loss criterion.
-        criterion2 (callable): Second loss criterion.
-        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
-        num_epochs (int): Number of training epochs.
-        device (torch.device): Device to run the model on.
-        writer (SummaryWriter): TensorBoard SummaryWriter for logging.
+        model (torch.nn.Module): The neural network model
+        train_loader (DataLoader): DataLoader for training data
+        val_loader (DataLoader): DataLoader for validation data
+        criterion1, criterion2 (callable): Loss functions
+        optimizer (torch.optim.Optimizer): Optimizer for model parameters
+        num_epochs (int): Number of training epochs
+        device (torch.device): Device to run the model on
+        writer (SummaryWriter): TensorBoard SummaryWriter for logging
+        checkpoints_dir (str): Directory to save model checkpoints
     """
-    # Initialize Dice metric for training and validation
+    # Initialize metrics and variables
+    train_dice_metric, val_dice_metric = initialize_metrics()
+    best_loss, alpha, accumulation_steps = 100.00, LOSS_ALPHA, ACCUMULATION
+    best_LI, best_LI_sens, best_LI_trn = 0, 0, 0
+    post_pred = AsDiscrete(argmax=True, to_onehot=OUT_CHANNELS)
+
+    for epoch in range(num_epochs):
+        # Training phase
+        train_loss, train_dice_scores = train_epoch(model, train_loader, optimizer, criterion1, criterion2, 
+                                                    alpha, train_dice_metric, post_pred, accumulation_steps, device)
+        
+        # Log training results
+        log_results(writer, epoch, train_loss, train_dice_scores, "Train")
+        
+        # Validation phase (if LI dice score is above threshold)
+        if train_dice_scores[0][3] > VAL_THRESHOLD:
+            best_LI_trn = train_dice_scores[0][3].item()
+            val_loss, val_dice_scores, sensitivity = validate_model(model, val_loader, criterion1, criterion2, 
+                                                                    alpha, val_dice_metric, device, post_pred)
+            
+            # Log validation results
+            log_results(writer, epoch, val_loss, val_dice_scores, "Val")
+            log_sensitivity(writer, epoch, sensitivity)
+            
+            # Save best models
+            save_best_models(model, optimizer, epoch, val_loss, val_dice_scores, sensitivity, 
+                             best_LI, best_LI_sens, best_loss, checkpoints_dir)
+        
+        # Save last model
+        save_model(model, optimizer, epoch, val_loss, os.path.join(checkpoints_dir, "last_model.pth"))
+        
+        print()  # Add a blank line for readability in console output
+
+def initialize_metrics():
+    """Initialize and return Dice metrics for training and validation."""
     train_dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=True)
     val_dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=True)
-    sensitivity_metric = ConfusionMatrixMetric(include_background=False, metric_name="sensitivity", compute_sample=True, reduction="mean_batch")
+    return train_dice_metric, val_dice_metric
+
+def train_epoch(model, train_loader, optimizer, criterion1, criterion2, alpha, train_dice_metric, post_pred, accumulation_steps, device):
+    """Perform one epoch of training."""
+    model.train()
+    train_loss = 0.0
+    train_dice_metric.reset()
     
-    post_pred = AsDiscrete(argmax=True, to_onehot=OUT_CHANNELS)  # 7 is the number of classes
-    accumulation_steps = 1
-    optimizer.zero_grad()
-    best_loss = float('inf')
-    alpha = 0.5
-    best_LI, best_LI_sens, best_LI_trn = 0, 0, 0
-    
-    for epoch in range(num_epochs):
-        model.train()
-        train_loss = 0.0
-        train_dice_metric.reset()
+    for b_index, batch in enumerate(tqdm(train_loader, desc=f"Training")):
+        inputs, targets = batch['image'].to(device), batch['label'].to(device)
+        targets = preprocess_targets(targets)
         
-        for b_index, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
-            inputs, targets = batch['image'].to(device), batch['label'].to(device)
-            # Add the new class channel
-            targets = torch.cat([(targets.sum(dim=1) == 0).unsqueeze(1), targets], dim=1)
-            targets[:,1,:,:,:]=targets[:,1,:,:,:]+targets[:,7,:,:,:]
-            targets = targets[:,:7,:,:,:]
-            
-            #optimizer.zero_grad()
-            outputs = model(inputs)
-            
-            # Calculate Dice scores
-            train_dice_metric(y_pred=torch.stack([post_pred(output) for output in outputs]), y=targets)
-            
-            if alpha==1:
-                loss = criterion1(outputs, targets)
-            elif alpha==0:
-                loss = criterion2(outputs, targets)
-            else:
-                loss = 2* (alpha * criterion1(outputs, targets) + (1-alpha) * criterion2(outputs, targets))
-                
-            loss.backward()
-            if (b_index + 1) % accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-            
-            train_loss += loss.item()
-            
-        if (b_index + 1) % accumulation_steps != 0:
+        outputs = model(inputs)
+        train_dice_metric(y_pred=torch.stack([post_pred(output) for output in outputs]), y=targets)
+        
+        loss = calculate_loss(outputs, targets, criterion1, criterion2, alpha)
+        loss.backward()
+        
+        if (b_index + 1) % accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
         
-        train_loss /= len(train_loader)
-        train_dice_scores = train_dice_metric.aggregate()
-        
-        # Print epoch results
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.4f}")
-        writer.add_scalar(f'Loss/Train', train_loss, global_step=epoch)
-        print("Train Dice Scores:")
-        for class_idx, score in enumerate(train_dice_scores[0]):
-            print(f"Class {class_idx + 1}: {score.item():.4f}")
-            writer.add_scalar(f'Dice/Train/Class_{class_idx}', score.item(), global_step=epoch)
-        
-        val_loss = 0.0
-        if train_dice_scores[0][3]>.06: #(best_LI_trn-(best_LI_trn*.1))
-            best_LI_trn = train_dice_scores[0][3].item()
-        
-            # Validation
-            model.eval()
-            
-            val_dice_metric.reset()
-            sensitivity_metric.reset()
-            with torch.no_grad():
-                for batch in val_loader:
-                    inputs, targets = batch['image'].to(device), batch['label'].to(device)
-                    patch_size=32
-                    stride=16
-                    # Add background glass to labels
-                    targets = torch.cat([(targets.sum(dim=1) == 0).unsqueeze(1), targets], dim=1)
-                    targets[:,1,:,:,:]=targets[:,1,:,:,:]+targets[:,7,:,:,:]
-                    targets = targets[:,:7,:,:,:]
-                    
-                    B, C, D, H, W = targets.shape
-                
-                    # Create an empty tensor to store the predictions                   
-                    predictions = torch.zeros_like(targets)
-                    count = torch.zeros_like(targets)
-                    
-                    # Loop over the volume with the given stride
-                    for d in range(0, D - patch_size + 1, stride):
-                        for h in range(0, H - patch_size + 1, stride):
-                            for w in range(0, W - patch_size + 1, stride):
-                                # Extract patch
-                                patch = inputs[:,:, d:d+patch_size, h:h+patch_size, w:w+patch_size]
-                                
-                                # Get prediction
-                                prediction = model(patch)
-                                
-                                # Add prediction to the full volume
-                                predictions[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size] += prediction
-                                count[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size] += 1
-                    
-                    final_prediction = predictions / count
-                    val_dice_metric(y_pred=torch.stack([post_pred(output) for output in final_prediction]), y=targets)
-                    sensitivity_metric(y_pred=torch.stack([post_pred(output) for output in final_prediction]),  y=targets)
+        train_loss += loss.item()
     
-                    if alpha==1:
-                        loss = criterion1(final_prediction, targets)
-                    elif alpha==0:
-                        loss = criterion2(final_prediction, targets)
-                    else:
-                        loss = 2* (alpha * criterion1(final_prediction, targets) + (1-alpha) * criterion2(final_prediction, targets))
-                    val_loss += loss.item()
+    if (b_index + 1) % accumulation_steps != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+    
+    train_loss /= len(train_loader)
+    train_dice_scores = train_dice_metric.aggregate()
+    
+    return train_loss, train_dice_scores
+
+def validate_model(model, val_loader, criterion1, criterion2, alpha, val_dice_metric, device, post_pred):
+    """Perform validation on the model."""
+    model.eval()
+    val_loss = 0.0
+    val_dice_metric.reset()
+    sensitivity_metric = ConfusionMatrixMetric(include_background=False, metric_name="sensitivity", 
+                                               compute_sample=True, reduction="mean_batch")
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            inputs, targets = batch['image'].to(device), batch['label'].to(device)
+            targets = preprocess_targets(targets)
             
-            val_loss /= len(val_loader)
-            val_dice_scores = val_dice_metric.aggregate()
-            sensitivity = sensitivity_metric.aggregate()
-        
-            print("Validation Dice Scores:")
-            writer.add_scalar(f'Loss/Val', val_loss, global_step=epoch)
-            print(f"Val Loss: {val_loss:.4f}")
-            for class_idx, score in enumerate(val_dice_scores[0]):
-                print(f"Class {class_idx + 1}: {score.item():.4f}")
-                writer.add_scalar(f'Dice/Val/Class_{class_idx}', score.item(), global_step=epoch)
-            for class_idx, score in enumerate(sensitivity[0]):
-                print(f"Class {class_idx + 1}: {score.item():.4f}")
-                writer.add_scalar(f'Dice/Sensitivity/Class_{class_idx}', score.item(), global_step=epoch)
-        
-            # Save the model
-            if val_dice_scores[0][3]>best_LI:
-                best_LI = val_dice_scores[0][3].item()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_loss
-                }, os.path.join(checkpoints_dir, "besLI.pth"))
-            if sensitivity[0][3]>best_LI_sens:
-                best_LI_sens = sensitivity[0][3].item()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_loss
-                }, os.path.join(checkpoints_dir, "besLIsens.pth"))
-            if val_loss<best_loss:
-                best_loss = val_loss
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_loss
-                }, os.path.join(checkpoints_dir, "best_model.pth"))
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_loss
-        }, os.path.join(checkpoints_dir, "last_model.pth"))
-        
-        print()
+            predictions = predict_full_volume(model, inputs, patch_size=PATCH_SIZE, stride=STRIDE)
+            
+            val_dice_metric(y_pred=torch.stack([post_pred(output) for output in predictions]), y=targets)
+            sensitivity_metric(y_pred=torch.stack([post_pred(output) for output in predictions]), y=targets)
+            
+            loss = calculate_loss(predictions, targets, criterion1, criterion2, alpha)
+            val_loss += loss.item()
+    
+    val_loss /= len(val_loader)
+    val_dice_scores = val_dice_metric.aggregate()
+    sensitivity = sensitivity_metric.aggregate()
+    
+    return val_loss, val_dice_scores, sensitivity
+
+def predict_full_volume(model, inputs, patch_size, stride):
+    """Predict on full volume using sliding window approach."""
+    B, C, D, H, W = inputs.shape
+    predictions = torch.zeros_like(inputs)
+    count = torch.zeros_like(inputs)
+    
+    for d in range(0, D - patch_size + 1, stride):
+        for h in range(0, H - patch_size + 1, stride):
+            for w in range(0, W - patch_size + 1, stride):
+                patch = inputs[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size]
+                prediction = model(patch)
+                predictions[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size] += prediction
+                count[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size] += 1
+    
+    return predictions / count
+
+def preprocess_targets(targets):
+    """Preprocess target labels."""
+    targets = torch.cat([(targets.sum(dim=1) == 0).unsqueeze(1), targets], dim=1)
+    targets[:, 1, :, :, :] = targets[:, 1, :, :, :] + targets[:, 7, :, :, :]
+    return targets[:, :7, :, :, :]
+
+def calculate_loss(outputs, targets, criterion1, criterion2, alpha):
+    """Calculate the combined loss."""
+    if alpha == 1:
+        return criterion1(outputs, targets)
+    elif alpha == 0:
+        return criterion2(outputs, targets)
+    else:
+        return 2 * (alpha * criterion1(outputs, targets) + (1-alpha) * criterion2(outputs, targets))
+
+def log_results(writer, epoch, loss, dice_scores, phase):
+    """Log results to TensorBoard."""
+    writer.add_scalar(f'Loss/{phase}', loss, global_step=epoch)
+    for class_idx, score in enumerate(dice_scores[0]):
+        writer.add_scalar(f'Dice/{phase}/Class_{class_idx}', score.item(), global_step=epoch)
+
+def log_sensitivity(writer, epoch, sensitivity):
+    """Log sensitivity scores to TensorBoard."""
+    for class_idx, score in enumerate(sensitivity[0]):
+        writer.add_scalar(f'Sensitivity/Class_{class_idx}', score.item(), global_step=epoch)
+
+def save_best_models(model, optimizer, epoch, val_loss, val_dice_scores, sensitivity, best_LI, best_LI_sens, best_loss, checkpoints_dir):
+    """Save the best models based on different metrics."""
+    if val_dice_scores[0][3] > best_LI:
+        best_LI = val_dice_scores[0][3].item()
+        save_model(model, optimizer, epoch, val_loss, os.path.join(checkpoints_dir, "bestLI.pth"))
+    
+    if sensitivity[0][3] > best_LI_sens:
+        best_LI_sens = sensitivity[0][3].item()
+        save_model(model, optimizer, epoch, val_loss, os.path.join(checkpoints_dir, "bestLIsens.pth"))
+    
+    if val_loss < best_loss:
+        best_loss = val_loss
+        save_model(model, optimizer, epoch, val_loss, os.path.join(checkpoints_dir, "best_model.pth"))
+
+def save_model(model, optimizer, epoch, val_loss, path):
+    """Save model checkpoint."""
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss
+    }, path)

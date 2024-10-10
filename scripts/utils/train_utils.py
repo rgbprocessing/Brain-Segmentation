@@ -1,11 +1,37 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Tue Oct  8 17:48:46 2024
+# train_utils.py
+# This module contains utility functions for managing training runs and the 
+# main training loop for a brain MRI segmentation model. It includes 
+# functionality for creating incremented run folders, setting up checkpoints 
+# and logs, and the core training and validation process.
+#
+# Author: Dani
+# Created: 2022-08-22
+# Last Modified: 2024-10-08
+#
+# Part of the Brain Segmentation Project
+# Requires: os, torch, monai
+# 
+# Note: This script is part of a larger brain segmentation project. For full 
+# context and additional components, please refer to the project's documentation.
 
-@author: Dragon
-"""
+from ..config_general import *
+import os
+import torch
+from tqdm import tqdm
+from monai.metrics import DiceMetric, ConfusionMatrixMetric
+from monai.transforms import AsDiscrete
 
 def create_incremented_run_folder(base_path="./runs"):
+    """
+    Create a new run folder with an incremented number.
+    
+    Args:
+        base_path (str): Base directory for run folders.
+    
+    Returns:
+        str: Path to the newly created run folder.
+    """
     # Ensure the base directory exists
     os.makedirs(base_path, exist_ok=True)
 
@@ -29,6 +55,12 @@ def create_incremented_run_folder(base_path="./runs"):
     return new_run_path
 
 def create_run_folder():
+    """
+    Create a new run folder with subdirectories for checkpoints and logs.
+    
+    Returns:
+        tuple: Paths to run directory, checkpoints directory, and logs directory.
+    """
     run_dir = create_incremented_run_folder(base_path="./runs_patches")
     checkpoints_dir = os.path.join(run_dir, "checkpoints")
     logs_dir = os.path.join(run_dir, "logs", "tensorboard_logs")
@@ -38,27 +70,32 @@ def create_run_folder():
     
     return run_dir, checkpoints_dir, logs_dir
 
-def train_model(model, train_loader, val_loader, criterion1, criterion2, optimizer, num_epochs, device):
+def train_model(model, train_loader, val_loader, criterion1, criterion2, optimizer, num_epochs, device, writer):
+    """
+    Main training loop for the brain MRI segmentation model.
+    
+    Args:
+        model (torch.nn.Module): The neural network model.
+        train_loader (DataLoader): DataLoader for training data.
+        val_loader (DataLoader): DataLoader for validation data.
+        criterion1 (callable): First loss criterion.
+        criterion2 (callable): Second loss criterion.
+        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
+        num_epochs (int): Number of training epochs.
+        device (torch.device): Device to run the model on.
+        writer (SummaryWriter): TensorBoard SummaryWriter for logging.
+    """
     # Initialize Dice metric for training and validation
     train_dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=True)
     val_dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=True)
-    best_loss = 100.00
-    alpha = .5
-    post_pred = AsDiscrete(argmax=True, to_onehot=7)  # 7 is the number of classes
+    sensitivity_metric = ConfusionMatrixMetric(include_background=False, metric_name="sensitivity", compute_sample=True, reduction="mean_batch")
+    
+    post_pred = AsDiscrete(argmax=True, to_onehot=OUT_CHANNELS)  # 7 is the number of classes
     accumulation_steps = 1
     optimizer.zero_grad()
-    best_LI = 0
-    best_LI_sens = 0
-    best_LI_trn = 0
-    
-
-
-    sensitivity_metric = ConfusionMatrixMetric(
-        include_background=False,
-        metric_name="sensitivity",
-        compute_sample=True,
-        reduction="mean_batch"
-    )
+    best_loss = float('inf')
+    alpha = 0.5
+    best_LI, best_LI_sens, best_LI_trn = 0, 0, 0
     
     for epoch in range(num_epochs):
         model.train()
@@ -71,7 +108,6 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
             targets = torch.cat([(targets.sum(dim=1) == 0).unsqueeze(1), targets], dim=1)
             targets[:,1,:,:,:]=targets[:,1,:,:,:]+targets[:,7,:,:,:]
             targets = targets[:,:7,:,:,:]
-            
             
             #optimizer.zero_grad()
             outputs = model(inputs)
@@ -87,7 +123,6 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
                 loss = 2* (alpha * criterion1(outputs, targets) + (1-alpha) * criterion2(outputs, targets))
                 
             loss.backward()
-            #optimizer.step()
             if (b_index + 1) % accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -131,10 +166,7 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
                     
                     B, C, D, H, W = targets.shape
                 
-                    # Create an empty tensor to store the predictions
-                    ##predictions = torch.zeros_like(targets)
-                    ##count = torch.zeros_like(targets)
-                    
+                    # Create an empty tensor to store the predictions                   
                     predictions = torch.zeros_like(targets)
                     count = torch.zeros_like(targets)
                     
@@ -147,7 +179,6 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
                                 
                                 # Get prediction
                                 prediction = model(patch)
-                                
                                 
                                 # Add prediction to the full volume
                                 predictions[:, :, d:d+patch_size, h:h+patch_size, w:w+patch_size] += prediction
@@ -169,8 +200,6 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
             val_dice_scores = val_dice_metric.aggregate()
             sensitivity = sensitivity_metric.aggregate()
         
-        
-        
             print("Validation Dice Scores:")
             writer.add_scalar(f'Loss/Val', val_loss, global_step=epoch)
             print(f"Val Loss: {val_loss:.4f}")
@@ -181,7 +210,7 @@ def train_model(model, train_loader, val_loader, criterion1, criterion2, optimiz
                 print(f"Class {class_idx + 1}: {score.item():.4f}")
                 writer.add_scalar(f'Dice/Sensitivity/Class_{class_idx}', score.item(), global_step=epoch)
         
-            # Here you can add code to save the model, update learning rate, etc.
+            # Save the model
             if val_dice_scores[0][3]>best_LI:
                 best_LI = val_dice_scores[0][3].item()
                 torch.save({

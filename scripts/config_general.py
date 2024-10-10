@@ -44,6 +44,7 @@ LABELS_FILENAME = "mask1B2G3P4L5W6E7V.pt"   # Labels filename
 PATCH_DATA_SHAPE = (2, 32, 32, 32)          # Final shape of data patches
 PATCH_LABELS_SHAPE = (7, 32, 32, 32)        # Final shape of label patches
 NUM_CLASSES_SAMPLE = 6                      # Number of classes to sample from [0,NUM_CLASSES_SAMPLE] inclusive
+TRANSFORM_PROB = 0.5
 
 # Augmentation configurations
 GAUSS_NOISE = 1/50                          # Standard deviation for Gaussian noise
